@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/shopping"
-          lscpu | rg 'Model name|^CPU\(s\)|Thread\(s\) per core'
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread\(s\) per core'
           ncpu=$(nproc)
           echo "Available logical CPUs $ncpu"
           gen=generator/target/release/generate

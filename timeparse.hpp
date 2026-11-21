@@ -43,7 +43,7 @@ public:
         if (s.size()!=20 && s.size()!=25) return timestamp(s);
         const auto& e=cache[slot(p)];
         uint16_t tail; memcpy(&tail,p+8,2);
-        if (read_word(p)!=e.head || tail!=e.tail) return timestamp(s);
+        if (!e.head || read_word(p)!=e.head || tail!=e.tail) return timestamp(s);
         const u64 clock=read_word(p+11);
         constexpr u64 colons=0x0000ff0000ff0000ULL;
         if (p[10]!='T' || (clock&colons)!=(0x3a3a3a3a3a3a3a3aULL&colons) ||
