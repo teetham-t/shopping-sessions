@@ -2,6 +2,7 @@
 #include "parquet.hpp"
 #include "fast_csv.hpp"
 #include "timeparse.hpp"
+#include "identities.hpp"
 #include <chrono>
 #include <iostream>
 #include <numeric>
@@ -15,6 +16,33 @@ struct Catalog {
     std::unordered_map<View,u32> products, campaign_index;
     std::deque<std::string> keys;
     u32 unknown;
+    std::vector<u32> product_numbers, campaign_numbers;
+    static u32 number(View s,size_t prefix) {
+        if (s.size()<=prefix || s.size()-prefix>7 || (s[prefix]=='0' && s.size()>prefix+1)) return UINT32_MAX;
+        u32 value=0;
+        for (size_t i=prefix;i<s.size();i++) {
+            u32 d=(unsigned char)s[i]-unsigned('0');
+            if (d>9) return UINT32_MAX;
+            value=value*10+d;
+        }
+        return value;
+    }
+    u32 campaign(View key) const {
+        if (key.starts_with("c_")) {
+            u32 n=number(key,2);
+            if (n<campaign_numbers.size()) return campaign_numbers[n];
+        }
+        auto it=campaign_index.find(key);
+        return it==campaign_index.end()?0:it->second;
+    }
+    u32 category_of(View key) const {
+        if (key.starts_with("p")) {
+            u32 n=number(key,1);
+            if (n<product_numbers.size()) return product_numbers[n];
+        }
+        auto it=products.find(key);
+        return it==products.end()?unknown:it->second;
+    }
     Catalog(const fs::path& path) {
         std::unordered_map<std::string,u32> categories_by_name;
         auto category=[&](View label) {
@@ -33,45 +61,22 @@ struct Catalog {
             keys.emplace_back(f[0]); campaign_index.emplace(keys.back(),campaigns.size());
             campaigns.emplace_back(f[0]); channels.emplace_back(f[1]);
         });
-    }
-};
-
-struct Links {
-    struct Node { u32 parent, size; u64 name; };
-    FlatMap<u32> ids;
-    std::vector<Node> nodes;
-    u32 get(u64 id) {
-        auto& slot=ids.insert(id,nodes.size());
-        if (slot.value==nodes.size()) nodes.push_back({slot.value,1,id});
-        return slot.value;
-    }
-    u32 root(u32 n) {
-        while (nodes[n].parent!=n) { n=nodes[n].parent=nodes[nodes[n].parent].parent; }
-        return n;
-    }
-    void join(u64 a,u64 b) {
-        u32 x=root(get(a)), y=root(get(b));
-        if (x==y) return;
-        if (nodes[x].size<nodes[y].size) std::swap(x,y);
-        nodes[y].parent=x; nodes[x].size+=nodes[y].size;
-    }
-    void finish(const Keys& users) {
-        for (u32 i=0;i<nodes.size();i++) {
-            auto& leader=nodes[root(i)];
-            if (users.less(nodes[i].name,leader.name)) leader.name=nodes[i].name;
+        product_numbers.assign(products.size()*2+1,unknown);
+        for (auto& [key,cat]:products) if (key.starts_with("p")) {
+            u32 n=number(key,1);
+            if (n<product_numbers.size()) product_numbers[n]=cat;
         }
-        for (auto& s:ids.slots) if (s.key) s.value=root(s.value);
-    }
-    void prefetch(u64 id) const { __builtin_prefetch(&ids.slots[mix(id)&(ids.slots.size()-1)]); }
-    u64 person(u64 id) {
-        auto& s=ids.locate(id);
-        return s.key ? nodes[s.value].name : id;
+        campaign_numbers.resize(campaign_index.size()*2+1);
+        for (auto& [key,id]:campaign_index) if (key.starts_with("c_")) {
+            u32 n=number(key,2);
+            if (n<campaign_numbers.size()) campaign_numbers[n]=id;
+        }
     }
 };
 
-struct Event { u64 id, user; i64 ts, ingested; u32 price, category; };
-struct Moment { i64 ts; u64 click; u32 amount, label; };
-struct Tagged { u64 person; Moment data; };
+
+template<class Time> struct Moment { u64 value; Time ts; u32 label; };
+template<class Time> struct Record { u64 ingest_or_click; Time ts; u32 person, amount, label; };
 struct Window { i64 lo, hi; };
 Window manifest(const fs::path& path) {
     std::ifstream in(path);
@@ -87,12 +92,34 @@ Window manifest(const fs::path& path) {
     return w;
 }
 
-struct InputWorker {
-    Bins<Event> events;
-    Bins<Tagged> timeline;
-    std::vector<Tagged> clicks;
-    std::vector<std::pair<u64,u64>> links;
+// Appending to one shard never moves an earlier record. A duplicate receipt
+// therefore needs only a key and a pointer, and only losers are touched again.
+template<class T> class Pages {
+    static constexpr size_t n=256;
+    std::vector<std::unique_ptr<T[]>> pages;
+    size_t count=0;
+public:
+    T* append(const T& record) {
+        if (!(count% n)) pages.emplace_back(new T[n]);
+        auto* dst=&pages.back()[count++%n]; *dst=record; return dst;
+    }
+    size_t size() const { return count; }
+    template<class F> void each(F fn) {
+        size_t left=count;
+        for (auto& page:pages) {
+            size_t take=std::min(n,left);
+            for (size_t i=0;i<take;i++) fn(page[i]);
+            left-=take;
+        }
+    }
+    void release() { pages.clear(); count=0; }
 };
+template<class Time> struct Receipt { u64 id; Record<Time>* record; };
+template<class Time> struct InputWorker {
+    Bins<Receipt<Time>> receipts;
+    std::array<Pages<Record<Time>>,bins> timeline;
+};
+constexpr u32 click_flag=1u<<31;
 struct UserDay { u64 person; int32_t day; i64 sessions, events, revenue; int32_t top; };
 struct Totals {
     i64 sessions=0, buyers=0, revenue=0, assists=0;
@@ -134,11 +161,32 @@ public:
         catalog(c),click_keys(k),revenues(c.categories.size()),latest(c.campaigns.size(),bad_time),
         campaign(utc_day(w.lo),utc_day(w.hi-1),c.campaigns.size()) {}
 
-    void person(u64 id,Moment* start,Moment* end) {
-        std::sort(start,end,[](const Moment& a,const Moment& b) {
-            if (a.ts!=b.ts) return a.ts<b.ts;
-            return bool(a.click)>bool(b.click);
-        });
+    template<class Time> void person(u64 id,Moment<Time>* start,Moment<Time>* end,i64 base) {
+        auto key=[](const Moment<Time>& m) { return (u64(m.ts)<<1) | !(m.label&click_flag); };
+        // Large shared-device and high-activity histories are bandwidth bound.
+        // Three stable 11-bit passes cover the common 32-bit manifest offset.
+        if constexpr (sizeof(Time)==4) {
+            if (end-start>=2048) {
+                thread_local std::vector<Moment<Time>> scratch;
+                scratch.resize(end-start);
+                std::array<std::array<u32,2048>,3> counts{};
+                for (auto p=start;p!=end;++p) {
+                    u64 k=key(*p);
+                    ++counts[0][k&2047]; ++counts[1][(k>>11)&2047]; ++counts[2][k>>22];
+                }
+                auto* src=start;
+                auto* dst=scratch.data();
+                for (unsigned pass=0;pass<3;pass++) {
+                    u32 offset=0;
+                    for (auto& count:counts[pass]) { auto n=count; count=offset; offset+=n; }
+                    for (size_t j=0;j<scratch.size();j++) {
+                        auto v=src[j]; dst[counts[pass][(key(v)>>(pass*11))&2047]++]=v;
+                    }
+                    std::swap(src,dst);
+                }
+                start=src; end=src+scratch.size();
+            } else std::sort(start,end,[&](const auto& a,const auto& b) { return key(a)<key(b); });
+        } else std::sort(start,end,[&](const auto& a,const auto& b) { return key(a)<key(b); });
         i64 prev=bad_time, last_click=bad_time;
         u64 best_id=0;
         u32 credited=0;
@@ -158,21 +206,23 @@ public:
             output.push_back(day);
         };
         for (auto p=start;p!=end;++p) {
-            if (p->click) {
-                if (latest[p->label]==bad_time) active.push_back(p->label);
-                latest[p->label]=p->ts;
-                if (p->ts!=last_click || click_keys.less(p->click,best_id)) {
-                    last_click=p->ts; best_id=p->click; credited=p->label;
+            i64 ts=base+i64(p->ts);
+            u32 label=p->label&~click_flag;
+            if (p->label&click_flag) {
+                if (latest[label]==bad_time) active.push_back(label);
+                latest[label]=ts;
+                if (ts!=last_click || click_keys.less(p->value,best_id)) {
+                    last_click=ts; best_id=p->value; credited=label;
                 }
                 continue;
             }
-            if (prev==bad_time || p->ts-prev>1'800'000) {
-                int32_t date=utc_day(p->ts);
+            if (prev==bad_time || ts-prev>1'800'000) {
+                int32_t date=utc_day(ts);
                 if (day.sessions && date!=day.day) {
                     finish_day(); day={id,date,0,0,0,-1};
                 }
                 day.day=date; ++day.sessions; purchased=false;
-                i64 floor=p->ts-week_ms;
+                i64 floor=ts-week_ms;
                 session=&campaign.at(date,last_click>=floor ? credited:0);
                 ++session->sessions;
                 size_t kept=0;
@@ -184,11 +234,11 @@ public:
                 }
                 active.resize(kept);
             }
-            prev=p->ts; ++day.events;
-            if (p->amount) {
-                if (!revenues[p->label]) purchases.push_back(p->label);
-                revenues[p->label]+=p->amount;
-                day.revenue+=p->amount; session->revenue+=p->amount;
+            prev=ts; ++day.events;
+            if (p->value) {
+                if (!revenues[label]) purchases.push_back(label);
+                revenues[label]+=p->value;
+                day.revenue+=p->value; session->revenue+=p->value;
                 if (!purchased) { ++session->buyers; purchased=true; }
             }
         }
@@ -233,7 +283,7 @@ void campaign_file(const fs::path& path,const CampaignDays& days,const Catalog& 
     file.append(count,v); file.finish();
 }
 
-void run(const fs::path& data,const fs::path& out,int threads) {
+template<class Time> void run(const fs::path& data,const fs::path& out,int threads,Window w) {
     auto then=std::chrono::steady_clock::now();
     auto mark=[&](const char* stage) {
         if (std::getenv("SESSION_PROFILE")) {
@@ -241,114 +291,107 @@ void run(const fs::path& data,const fs::path& out,int threads) {
             std::cerr<<stage<<" "<<std::chrono::duration<double>(now-then).count()<<"s\n"; then=now;
         }
     };
-    Window w=manifest(data/"manifest.json");
+    i64 base=w.lo-week_ms;
     Dates dates(w.lo,w.hi);
     Catalog catalog(data);
     Keys users('u'), event_ids('e'), click_ids('k');
     Inputs events(data/"events"), clicks(data/"clicks"), edges(data/"links");
-    std::vector<InputWorker> workers(threads);
+    std::vector<InputWorker<Time>> workers(threads);
     size_t bytes=0;
     for (auto block:events.blocks) bytes+=block.end-block.begin;
     size_t per_bin=bytes/(72*threads*bins);
-    for (auto& worker:workers) for (auto& part:worker.events) part.reserve(per_bin);
+    for (auto& worker:workers) for (auto& part:worker.receipts) part.reserve(per_bin);
     mark("open");
+    Identities links(edges,users,threads,bytes);
+    mark("identity");
     parallel(events.blocks.size(),threads,[&](int t,size_t i) {
+        auto& worker=workers[t];
+        struct Pending { u64 id, user; Record<Time> row; };
+        std::array<Pending,32> batch;
+        size_t pending=0;
+        auto flush=[&] {
+            for (size_t j=0;j<pending;j++) {
+                auto& item=batch[j];
+                auto& person=item.row.person;
+                person=item.user?links.person(item.user):0;
+                auto* record=worker.timeline[person&(bins-1)].append(item.row);
+                worker.receipts[bin(item.id)].push_back({item.id,record});
+            }
+            pending=0;
+        };
         fast_rows<7>(events.blocks[i],[&](const auto& f) {
             if (f[0].empty()) return;
-            Event e{event_ids.get(f[0]),0,dates.parse(f[2]),dates.parse(f[3]),0,0};
-            if (!f[1].empty() && !f[5].empty() && e.ts>=w.lo && e.ts<w.hi && e.ingested-e.ts<=day_ms) {
-                if (f[4]=="view" || f[4]=="cart") e.user=users.get(f[1]);
+            i64 ts=dates.parse(f[2]), ingested=dates.parse(f[3]);
+            u64 user=0; u32 price=0,category=0;
+            if (!f[1].empty() && !f[5].empty() && ts>=w.lo && ts<w.hi && ingested-ts<=day_ms) {
+                if (f[4]=="view" || f[4]=="cart") user=users.get(f[1]);
                 else if (f[4]=="purchase") {
-                    auto price=decimal(f[6],10'000'000);
-                    if (price>0) {
-                        e.price=price; e.user=users.get(f[1]);
-                        auto it=catalog.products.find(f[5]);
-                        e.category=it==catalog.products.end()?catalog.unknown:it->second;
+                    auto amount=decimal(f[6],10'000'000);
+                    if (amount>0) {
+                        price=amount; user=users.get(f[1]);
+                        category=catalog.category_of(f[5]);
                     }
                 }
             }
-            // Invalid winners are tombstones and still participate in global dedup.
-            workers[t].events[bin(e.id)].push_back(e);
+            links.prefetch(user);
+            batch[pending++]={event_ids.get(f[0]),user,{u64(ingested),Time(user?ts-base:0),0,price,category}};
+            if (pending==batch.size()) flush();
         });
+        flush();
     });
     mark("events");
     parallel(clicks.blocks.size(),threads,[&](int t,size_t i) {
+        auto& worker=workers[t];
         fast_rows<4>(clicks.blocks[i],[&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
             i64 ts=dates.parse(f[3]);
             if (ts<w.lo-week_ms || ts>=w.hi) return;
-            auto it=catalog.campaign_index.find(f[2]);
-            if (it!=catalog.campaign_index.end())
-                workers[t].clicks.push_back({users.get(f[1]),{ts,click_ids.get(f[0]),0,it->second}});
+            u32 campaign=catalog.campaign(f[2]);
+            if (campaign) {
+                u32 person=links.person(users.get(f[1]));
+                worker.timeline[person&(bins-1)].append({click_ids.get(f[0]),Time(ts-base),person,0,campaign|click_flag});
+            }
         });
     });
     mark("clicks");
-    parallel(edges.blocks.size(),threads,[&](int t,size_t i) {
-        rows<2>(edges.blocks[i],[&](const auto& f) {
-            if (!f[0].empty() && !f[1].empty()) workers[t].links.emplace_back(users.get(f[0]),users.get(f[1]));
-        });
-    });
-    Links links;
-    for (auto& worker:workers) for (auto [a,b]:worker.links) links.join(a,b);
-    links.finish(users);
-    mark("identity");
-    parallel(bins,threads,[&](int t,size_t b) {
+    parallel(bins,threads,[&](int,size_t b) {
         size_t count=0;
-        for (auto& worker:workers) count+=worker.events[b].size();
-        FlatMap<Event*> winners(count);
-        for (auto& worker:workers) for (auto& e:worker.events[b]) {
-            auto& slot=winners.locate(e.id);
-            if (!slot.key) slot={e.id,&e};
-            else if (e.ingested<slot.value->ingested) { slot.value->user=0; slot.value=&e; }
-            else e.user=0;
-        }
-        auto& dest=workers[t].timeline;
+        for (auto& worker:workers) count+=worker.receipts[b].size();
+        FlatMap<Record<Time>*> winners(count);
         for (auto& worker:workers) {
-            auto& list=worker.events[b];
-            for (size_t j=0;j<list.size();++j) {
-                if (j+16<list.size()) links.prefetch(list[j+16].user);
-                const auto& e=list[j];
-                if (!e.user) continue;
-                u64 person=links.person(e.user);
-                dest[bin(person)].push_back({person,{e.ts,0,e.price,e.category}});
+            auto& receipts=worker.receipts[b];
+            for (auto& r:receipts) {
+                auto& slot=winners.locate(r.id);
+                if (!slot.key) slot={r.id,r.record};
+                else if (i64(r.record->ingest_or_click)<i64(slot.value->ingest_or_click)) {
+                    slot.value->person=0; slot.value=r.record;
+                } else r.record->person=0;
             }
+            std::vector<Receipt<Time>>().swap(receipts);
         }
-        for (auto& worker:workers) std::vector<Event>().swap(worker.events[b]);
     });
-    parallel(workers.size(),threads,[&](int,size_t i) {
-        auto& worker=workers[i];
-        for (auto& c:worker.clicks) {
-            c.person=links.person(c.person);
-            worker.timeline[bin(c.person)].push_back(c);
-        }
-        std::vector<Tagged>().swap(worker.clicks);
-    });
-    mark("dedup and partition");
+    mark("dedup");
     std::vector<Aggregator> agg;
     for (int i=0;i<threads;i++) agg.emplace_back(catalog,click_ids,w);
     parallel(bins,threads,[&](int t,size_t b) {
-        size_t n=0;
-        for (auto& worker:workers) n+=worker.timeline[b].size();
-        struct Group { u32 end=0, cursor=0; };
-        FlatMap<Group> people(std::min<size_t>(n,n/24+16));
-        for (auto& worker:workers) for (auto& p:worker.timeline[b]) ++people.insert(p.person,{}).value.end;
-        u32 pos=0;
-        for (auto& s:people.slots) if (s.key) {
-            s.value.cursor=pos; pos+=s.value.end; s.value.end=pos;
-        }
-        std::unique_ptr<Moment[]> ordered(new Moment[n]);
+        std::vector<u32> start(links.extent(b)+1);
+        for (auto& worker:workers) worker.timeline[b].each([&](const Record<Time>& row) {
+            if (row.person) ++start[row.person/bins-1];
+        });
+        u32 total=0;
+        for (auto& count:start) { total+=count; count=total; }
+        std::unique_ptr<Moment<Time>[]> ordered(new Moment<Time>[total]);
         for (auto& worker:workers) {
-            for (auto& p:worker.timeline[b]) {
-                auto& g=people.locate(p.person).value;
-                ordered[g.cursor++]=p.data;
-            }
-            std::vector<Tagged>().swap(worker.timeline[b]);
+            auto& pages=worker.timeline[b];
+            pages.each([&](const Record<Time>& row) {
+                if (!row.person) return;
+                u64 value=(row.label&click_flag)?row.ingest_or_click:row.amount;
+                ordered[--start[row.person/bins-1]]={value,row.ts,row.label};
+            });
+            pages.release();
         }
-        pos=0;
-        for (auto& s:people.slots) if (s.key) {
-            agg[t].person(s.key,ordered.get()+pos,ordered.get()+s.value.end);
-            pos=s.value.end;
-        }
+        for (size_t j=0;j+1<start.size();j++) if (start[j]<start[j+1])
+            agg[t].person(links.name(b,j),ordered.get()+start[j],ordered.get()+start[j+1],base);
     });
     mark("sessions");
     fs::create_directories(out/"user_daily"); fs::create_directories(out/"campaign_daily");
@@ -366,7 +409,11 @@ int main(int argc,char** argv) {
         auto env=[](const char* key,const char* fallback) {
             const char* val=std::getenv(key); return val?val:fallback;
         };
-        run(argc>1?argv[1]:env("DATA_DIR","/data"),argc>2?argv[2]:env("OUTPUT_DIR","/output"),
-            std::clamp(std::atoi(env("NCPU","8")),1,64));
+        fs::path data=argc>1?argv[1]:env("DATA_DIR","/data");
+        fs::path out=argc>2?argv[2]:env("OUTPUT_DIR","/output");
+        int threads=std::clamp(std::atoi(env("NCPU","8")),1,64);
+        Window w=manifest(data/"manifest.json");
+        if (w.hi-w.lo<=i64(UINT32_MAX)-week_ms) run<u32>(data,out,threads,w);
+        else run<i64>(data,out,threads,w);
     } catch (const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
 }

@@ -42,7 +42,61 @@ inline Marks marks64(const char* data) {
     return m;
 }
 
+#if defined(__AVX2__) && defined(__BMI2__)
+// Gather quote bits at field starts and ends with PEXT. Matched pairs and
+// adjacency validate the complete row before any selected field is read.
+template<size_t N,class F> inline void marked_row(const char* p,Marks a,Marks b,unsigned length,F& emit) {
+    unsigned width=length&63;
+    u64 through=~u64(0)>>(63-width);
+    if (length<64) { a.comma&=through; a.quote&=through; b={}; }
+    else { b.comma&=through; b.quote&=through; }
+    u64 lo=a.comma, hi=b.comma;
+    if (length<64) lo|=u64(1)<<width; else hi|=u64(1)<<width;
+    unsigned low_count=__builtin_popcountll(lo);
+    if (low_count+__builtin_popcountll(hi)!=N) return;
+    u64 left_lo=(lo<<1)|1, left_hi=(hi<<1)|(lo>>63);
+    u64 right_lo=(lo>>1)|(hi<<63), right_hi=hi>>1;
+    if ((a.quote&~(left_lo^right_lo)) || (b.quote&~(left_hi^right_hi))) return;
+    u64 after=_pext_u64((a.quote>>1)|(b.quote<<63),lo) | (_pext_u64(b.quote>>1,hi)<<low_count);
+    u64 open=((after<<1)|(a.quote&1))&((u64(1)<<N)-1);
+    u64 close=_pext_u64(a.quote<<1,lo) | (_pext_u64((b.quote<<1)|(a.quote>>63),hi)<<low_count);
+    if (open!=close) return;
+    std::array<unsigned,N> ends;
+    unsigned j=0;
+    while (lo) { ends[j++]=__builtin_ctzll(lo); lo&=lo-1; }
+    while (hi) { ends[j++]=64+__builtin_ctzll(hi); hi&=hi-1; }
+    std::array<View,N> fields;
+    unsigned start=0;
+    for (size_t k=0;k<N;k++) {
+        unsigned q=(open>>k)&1;
+        fields[k]=View(p+start+q,ends[k]-start-2*q);
+        start=ends[k]+1;
+    }
+    emit(fields);
+}
+#endif
+
 template<size_t N, class F> void fast_rows(Block block, F emit) {
+#if defined(__AVX2__) && defined(__BMI2__)
+    const char* at=block.begin;
+    while (block.end-at>=128) {
+        Marks a=marks64(at), b{};
+        unsigned n;
+        if (a.lf) n=__builtin_ctzll(a.lf);
+        else {
+            b=marks64(at+64);
+            if (!b.lf) {
+                const char* lf=static_cast<const char*>(memchr(at+128,'\n',block.end-at-128));
+                const char* stop=lf?lf+1:block.end;
+                rows<N>({at,stop},emit); at=stop; continue;
+            }
+            n=64+__builtin_ctzll(b.lf);
+        }
+        marked_row<N>(at,a,b,n,emit); at+=n+1;
+    }
+    rows<N>({at,block.end},emit);
+    return;
+#endif
     // Offsets in each tile fit in 15 bits. High bits mark parity of the
     // cumulative quote count. It must agree at both ends of every field.
     constexpr int tile=8192;
@@ -106,7 +160,8 @@ template<size_t N, class F> void fast_rows(Block block, F emit) {
                     unsigned word=separators[token+j], finish=word&32767;
                     parity_diff|=word^before;
                     int quote=base[begin]=='"';
-                    fields[j]=View(base+begin+quote,finish-begin-2*quote);
+                    auto length=int(finish)-begin-2*quote;
+                    fields[j]=View(base+begin+quote,std::max(length,0));
                     begin=finish+1;
                 }
                 if (!(parity_diff&32768)) emit(fields);

@@ -51,7 +51,8 @@ public:
         size_t n = field.size() - 1;
         if (n < 9 && n && field[0] == prefix) {
             u64 raw = 0;
-            std::memcpy(&raw, field.data()+1, n);
+            if (n==8) std::memcpy(&raw,field.data()+1,8);
+            else std::memcpy(&raw,field.data()+1,n);
             u64 key = __builtin_bswap64(raw);
             // Padding can never alias strings if the final byte is nonzero.
             if (!(key & indirect) && field.back() != 0) return key;

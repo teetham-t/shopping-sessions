@@ -2,7 +2,7 @@
 
 Team **ttham.t**'s C++20 entry for the Databricks Shopping Sessions track at the Builders Buildathon.
 
-The executable reads the manifest, catalogs and all three CSV directories, and writes the user and campaign daily tables to Parquet. The Docker image contains a statically linked executable. It runs offline as uid 1000.
+The executable reads the manifest, catalogs and all three CSV directories, and writes the user and campaign daily tables to Parquet. The Docker image selects a statically linked executable for the available CPU. It runs offline as uid 1000.
 
 ## Run
 
@@ -28,7 +28,7 @@ c++ -std=c++20 -O3 -DNDEBUG -pthread main.cpp -o sessions
 
 CSV readers divide uneven files at line boundaries. They validate quote placement and preserve field bytes, including spaces and carriage returns. A disjoint-set forest resolves transitive identities and selects the byte-wise smallest name in each component.
 
-Workers partition events by their exact event ID. Each partition retains the earliest well-formed copy, including an invalid winner that suppresses later valid copies. The retained events and valid clicks are then grouped by person and sorted by time. Keeping identical repeated clicks in the time stream preserves both the minimum tied click ID and the set of distinct assisting campaigns. The session scan assigns purchases and category totals to the session's start date. A small Parquet writer emits typed dates, 64-bit totals and optional UTF-8 categories.
+Workers place parsed rows in stable memory pages grouped by shopper partition. A separate index of exact event IDs points to those rows. Each ID partition marks losing copies before sessionization, including later valid copies whose earliest well-formed copy failed validation. Dense shopper indices allow two sequential passes to group the surviving events and clicks. Large histories use a radix sort on time and the click-before-event tie rule. Keeping identical repeated clicks in the time stream preserves both the minimum tied click ID and the set of distinct assisting campaigns. The session scan assigns purchases and category totals to the session's start date. A small Parquet writer emits typed dates, 64-bit totals and optional UTF-8 categories.
 
 ## Verification
 

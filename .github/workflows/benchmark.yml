@@ -1,0 +1,68 @@
+name: Native x86 benchmark
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Fetch the selected revision
+        run: |
+          git init .
+          git fetch --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Build the submission and Rust generator
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -t shopping-sessions .
+          mkdir -p "$RUNNER_TEMP/shopping"
+          cd "$RUNNER_TEMP/shopping"
+          url=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator starter-polars dev-answer; do
+            curl -fsSL --retry 3 "$url/$file.zip" -o "$file.zip"
+            unzip -q "$file.zip"
+          done
+          cargo build --release --offline --manifest-path generator/Cargo.toml
+          python3 -m venv verify
+          verify/bin/pip -q install polars==1.35.2
+      - name: Check the official dev answer and time fresh datasets
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shopping"
+          lscpu | rg 'Model name|^CPU\(s\)|Thread\(s\) per core'
+          ncpu=$(nproc)
+          echo "Available logical CPUs $ncpu"
+          gen=generator/target/release/generate
+          runtime=(--network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --user 1000:1000
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus "$ncpu"
+            -e NCPU="$ncpu" -e HOME=/scratch -e DATA_DIR=/data -e OUTPUT_DIR=/output
+            -e SCRATCH_DIR=/scratch -e SESSION_PROFILE=1)
+          mkdir -p scratch
+          chmod 777 scratch
+          for spec in "dev 1 1000000 250000" "practice 20261122 20000000 5000000" "final 79489 60000000 15000000"; do
+            read -r label seed events clicks <<< "$spec"
+            "$gen" --seed "$seed" --events "$events" --clicks "$clicks" --threads "$ncpu" --output "$label"
+            for attempt in 1 2 3; do
+              dest="out-$label-$attempt"
+              mkdir "$dest"
+              chmod 777 "$dest"
+              container=$(docker create "${runtime[@]}" -v "$PWD/$label:/data:ro" \
+                -v "$PWD/$dest:/output" -v "$PWD/scratch:/scratch" shopping-sessions)
+              docker start -a "$container"
+              test "$(docker inspect -f '{{.State.ExitCode}}' "$container")" = 0
+              docker inspect "$container" | python3 -c '
+          import sys, json, datetime
+          state = json.load(sys.stdin)[0]["State"]
+          parse = datetime.datetime.fromisoformat
+          t = (parse(state["FinishedAt"]) - parse(state["StartedAt"])).total_seconds()
+          print(sys.argv[1], "run", sys.argv[2], "container seconds", t)
+          ' "$label" "$attempt" | tee -a "$GITHUB_STEP_SUMMARY"
+              docker rm "$container" >/dev/null
+              if [[ $label == dev ]]; then
+                verify/bin/python starter-polars/scripts/compare.py "$dest" dev-answer
+                break
+              fi
+            done
+            rm -rf -- "$label"
+          done
